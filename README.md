@@ -73,17 +73,53 @@ $DSH_PROFILE_DIR/superagent-mini  否则跟着 profile
 
 上游有独立的 Source / Eval / Assignment 分层，支持多种来源和更细的准入策略。这里全压平了：一个工具入口、一个矩阵、一个子会话执行器。
 
-也**没有实测过大量并发**。写的时候考虑到了，但没压测过。
+并发做过压测：`maxConcurrent=8` 时峰值就是 8，闸门没有失效。但**写放大没修**，见下面《不足》。
 
 这是能用的实验品，不是生产级组件。
 
 ## 装
 
+从 GitHub 装：
+
 ```bash
 dsh plugin --profile web add github:NOI258/dsh-superagent-mini
 ```
 
+或从 npm 装（已发布的话）：
+
+```bash
+dsh plugin --profile web add dsh-superagent-mini
+```
+
 装完重启，十一个 `superagent_*` 工具出现在工具列表里。
+
+## 不足
+
+按影响排序。都是量过或有明确触发条件的，不是「可能有问题」。
+
+**1. 写放大：每条 Ticket 70–90ms，吞吐约 11 条/秒**
+每次状态变更都重写整份 `tickets.json`——一次 dispatch 一次完成，两次全量写。300 条时平均文件 145 KB，600 次写 ≈ 87 MB IO。所以端到端耗时和 Executor 快慢基本无关：一个 20ms 就能跑完的执行器，160 条 / 并发 8 实测 5.4 秒（纯执行理论 0.4 秒）。数据见《压测》。修法有得选（写去抖、完成时只追加 journal、归档已结束的 ticket），但都会动存储层的正确性，没有小改动方案。
+
+**2. 锁只在进程内**
+`read-modify-write` 的互斥是进程内的。两个进程指向同一个 store 目录会互相覆盖。设计上是「一个 DSH 实例一个 store」，但没有强制。
+
+**3. `STORE_DIR` / `STORE_FILE` 是模块级常量**
+`import` 时读一次环境变量，之后换 `DSH_SUPERAGENT_MINI_DIR` 不生效。同一进程里没法起两个独立实例，测试必须隔离到子进程。
+
+**4. 重开已 failed 的 Ticket 不重置重试预算**
+`reply` 把 failed 的 Ticket 重新打开时，`_attempts` 不清零，新的 Assignment 直接继承耗尽的重试次数，不会再重试。
+
+**5. Memory 没有容量上限**
+`memory.json` 只增不减，只有 recall 的 `limit` 控制取多少条返回，不控制存多少条。`used` 字段只读不写，排序里那 0.1 的权重恒为 0。
+
+**6. 配置数值不校验**
+`maxConcurrent` 传个非数字会变 `NaN`，`pump` 的条件永远为假，队列再也不出队。`executorTimeoutMs` 传 `NaN` 会立刻超时。没有 schema 校验。
+
+**7. trigger 超过 5000 会修剪，可能剪掉仍 open 的 Ticket**
+修剪是 FIFO，不区分状态。剪掉的 Ticket 再提同样请求会再开一张票。
+
+**8. 残余竞态窗口**
+`reply` 落在「prompt 已生成、assignment 还没写 running」之间时，消息会记录进 journal，但本次执行器看不到它。窗口很窄，没有完全原子化。
 
 ## 测试
 
