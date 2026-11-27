@@ -92,4 +92,4 @@ node test/resilience.mjs
 
 ## License
 
-MIT，沿用上游。
+MIT。部分代码来自 [deepseek-ai/dsh-superagent-prototype](https://github.com/deepseek-ai/dsh-superagent-prototype)，版权归 DeepSeek Harness Team，同样 MIT。完整声明见 LICENSE。
