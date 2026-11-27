@@ -1,53 +1,79 @@
 # dsh-superagent-mini
 
-给 DSH 用的一套极简 super-agent 循环：**提交一个请求 → 变成 ticket → 派子会话去执行**。
+想要的效果：丢一个请求进来，agent 自己开个子会话去干，干完回来说一声。DSH 自带的 `subagent` 是一次性的，回来就结束，没法「同一件事接着聊」。所以写了这个。
 
-不是一个 agent，是一个让 agent 排队干活的骨架。
-
-领域模型抄的是 [`deepseek-ai/dsh-superagent-prototype`](https://github.com/deepseek-ai/dsh-superagent-prototype)（MIT）：
-
-```
-Source → Trigger → Thread → Eval → Ticket → Assignment → Executor
-```
+领域模型来自 [`deepseek-ai/dsh-superagent-prototype`](https://github.com/deepseek-ai/dsh-superagent-prototype)（MIT，24k stars）。那边是分层完整的实现，我把它压成一个文件，加了长期记忆。
 
 ---
 
-## 三阶段
+## 用起来是这样
 
-1. **工具当 Source**。收到请求，过准入矩阵，Trigger 去重，落一张 Ticket
-2. **接受的 Ticket 交给 Executor** —— 一个子 DSH 会话
-3. **同 Thread 的后续消息**分发到还活着的 Ticket
+```
+superagent_request "把这个仓库的 README 翻译成英文"
+→ t-3f2a91c  开了一张票，派了执行器
+
+superagent_show  t-3f2a91c
+→ 看它做到哪一步了
+
+superagent_reply t-3f2a91c "顺便把 LICENSE 也翻了"
+→ 消息进同一张票，执行器下次醒来会看到
+
+superagent_cancel t-3f2a91c
+→ 不做了
+```
+
+票和执行器是两回事。执行器崩了，票还在；重试是票的事，不是会话的事。
 
 ## 十一个工具
 
-| 工具 | 干什么 |
-|---|---|
-| `superagent_request` | 提交请求，建 ticket |
-| `superagent_list` | 列 ticket |
-| `superagent_show` | 看单张，含 journal |
-| `superagent_cancel` | 取消，ticket 结束 |
-| `superagent_team` | 看板：每个 Thread 下有哪些开着的票 |
-| `superagent_reply` | 往已有 ticket 追加消息 |
-| `superagent_memory` | 读某个 ticket 的 journal |
-| `superagent_remember` | 写一条长期记忆 |
-| `superagent_recall` | 按关键词搜记忆 |
-| `superagent_forget` | 删一条记忆 |
-| `superagent_health` | 看循环状态：并发、积压、存储大小 |
+提交和查看：`superagent_request`、`superagent_list`、`superagent_show`、`superagent_team`、`superagent_health`
 
-## 数据存哪
+控制：`superagent_cancel`、`superagent_reply`
+
+记忆：`superagent_memory`（读某张票的 journal）、`superagent_remember`、`superagent_recall`、`superagent_forget`
+
+## 数据在哪
 
 ```
-$DSH_SUPERAGENT_MINI_DIR          # 显式指定优先
-$DSH_PROFILE_DIR/superagent-mini  # 否则跟着 profile
-~/.dsh/superagent-mini            # 最后兜底
+$DSH_SUPERAGENT_MINI_DIR          显式指定优先
+$DSH_PROFILE_DIR/superagent-mini  否则跟着 profile
+~/.dsh/superagent-mini            兜底
 ```
 
-两个文件：
+`tickets.json` 存票和 journal，`memory.json` 存长期记忆。
 
-- `tickets.json` — ticket 和它们的 journal
-- `memory.json` — 长期记忆
+**分开是有意的。** 票的 journal 随任务结束就没人看了，值得留下的教训要活过每一张产生它的票。
 
-**故意分开的。** ticket 的 journal 随任务结束而死，值得留下的教训要活过每一张产生它的 ticket。
+## 四个照抄来的规则
+
+`Trigger` 幂等——同一个请求提两次，只产生一张票。
+
+`Ticket` 的状态自己定义，不镜像执行器的会话状态。
+
+`Mandate` 不可变——想扩大范围就开新票，不在旧的上面改。
+
+准入是矩阵不是布尔值：
+
+```
+名单内、没点名   → inferred  推断要不要接
+名单外、点了名   → ignore    忽略
+都没有           → ignore    忽略
+```
+
+## 边界
+
+- journal 最多 200 条，trigger 最多 5000 个
+- 执行器默认 30 分钟超时，失败重试 1 次
+- 写盘 temp + rename，进程崩在写入中途不会坏文件
+- read-modify-write 走进程内互斥锁，防两个调用互相覆盖
+
+## 和上游比，少了什么
+
+上游有独立的 Source / Eval / Assignment 分层，支持多种来源和更细的准入策略。这里全压平了：一个工具入口、一个矩阵、一个子会话执行器。
+
+也**没有实测过大量并发**。写的时候考虑到了，但没压测过。
+
+这是能用的实验品，不是生产级组件。
 
 ## 装
 
@@ -55,36 +81,7 @@ $DSH_PROFILE_DIR/superagent-mini  # 否则跟着 profile
 dsh plugin --profile web add github:NOI258/dsh-superagent-mini
 ```
 
-装完重启 DSH，十一个 `superagent_*` 工具出现在模型可用的列表里。
-
-## 四个设计上的取舍
-
-**Trigger 不可变且幂等。** 同一个请求提两次，只产生一张 ticket。
-
-**Ticket 定义自己的状态。** 它不镜像 executor session 的状态——执行器崩了不代表票没了。
-
-**Mandate 不可变。** 想扩大范围就开新票，不能在旧的上面改。
-
-**准入是个矩阵，不是布尔值。**
-
-```
-listedUnaddressed:  'inferred'   名单内、没点名 → 推断要不要接
-unlistedAddressed:  'ignore'     名单外、点了名 → 忽略
-unlistedUnaddressed:'ignore'     都没有 → 忽略
-```
-
-## 一些边界
-
-- journal 最多 200 条，trigger 最多 5000 个
-- executor 默认超时 30 分钟，失败重试 1 次
-- 写盘走 temp + rename，进程崩在写入中途不会坏文件
-- read-modify-write 走进程内互斥锁，防两个并发调用互相覆盖
-
-## mini 在哪
-
-上游 prototype 有完整的 Source / Eval / Assignment 分层。这个版本把它们压平了：只有一道工具入口、一个准入矩阵、一个子会话执行器。
-
-够用，但不是生产级。适合想在 DSH 上试这套模型的人。
+装完重启，十一个 `superagent_*` 工具出现在工具列表里。
 
 ## 测试
 
@@ -95,4 +92,4 @@ node test/resilience.mjs
 
 ## License
 
-MIT（沿用上游）
+MIT，沿用上游。
