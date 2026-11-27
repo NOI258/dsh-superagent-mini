@@ -122,21 +122,45 @@ export function apply(ctx, config = {}) {
   // `live` maps a running Ticket to the Executor that owns it, which is what lets a person stop it.
   const live = new Map()
   const pending = []
+  // Ticket ids that are either waiting in `pending` or being handed to an Executor. An id is
+  // added once and removed only when that dispatch settles, so one Ticket cannot be given two
+  // Executors at once — not even when a reply re-queues a Ticket that was already queued, or a
+  // retry fires while the previous attempt is still winding down.
+  const inFlight = new Set()
   const maxConcurrent = Math.max(1, Number(config.maxConcurrent ?? 2))
   let runningCount = 0
+
+  /** Adds a Ticket to the queue unless that Ticket is already queued or being dispatched. */
+  function queueTicket(ticket) {
+    if (inFlight.has(ticket.id)) return false
+    inFlight.add(ticket.id)
+    pending.push(ticket)
+    return true
+  }
 
   /** Runs queued Tickets up to the concurrency limit; the whole team shares one budget of parallelism. */
   function pump() {
     while (runningCount < maxConcurrent && pending.length > 0) {
       const next = pending.shift()
       runningCount++
-      void dispatchTicket(next).finally(() => { runningCount--; pump() })
+      void dispatchTicket(next)
+        // The failure path itself reads the store. If that read fails too, nothing can be
+        // recorded anymore, but the rejection must still be contained: an unhandled rejection
+        // would terminate the host process instead of failing one Ticket.
+        .catch((error) => {
+          ctx.logger?.warn?.('dsh-superagent-mini: dispatch %s failed: %s', next.id, String(error?.message ?? error))
+        })
+        .finally(() => {
+          inFlight.delete(next.id)
+          runningCount--
+          pump()
+        })
     }
   }
 
   /** Accepts a Ticket into the execution queue and returns without waiting for the Executor. */
   function enqueue(ticket) {
-    pending.push(ticket)
+    queueTicket(ticket)
     pump()
   }
 
@@ -221,7 +245,8 @@ export function apply(ctx, config = {}) {
       score += Math.min(Number(memory.used ?? 0), 5) * 0.1
       return { memory, score }
     }).filter(row => row.score > 0)
-    scored.sort((a, b) => b.score - a.score)
+    scored.sort((a, b) => b.score - a.score
+      || String(b.memory.created_at ?? '').localeCompare(String(a.memory.created_at ?? '')))
     return scored.slice(0, limit).map(row => row.memory)
   }
 
@@ -242,15 +267,6 @@ export function apply(ctx, config = {}) {
    * on the Ticket. The Ticket keeps its own state; only this report may end it.
    */
   async function dispatchTicket(ticket) {
-    async function patch(fields) {
-      await storeLock(async () => {
-        const store = await readStore()
-        const row = store.tickets.find(t => t.id === ticket.id)
-        if (!row) return
-        Object.assign(row, fields)
-        await writeStore(store)
-      })
-    }
     /**
      * Writes fields only if the stored Ticket is still live, all inside one lock.
      *
@@ -282,10 +298,22 @@ export function apply(ctx, config = {}) {
       const provider = subagents.list()[0]
       if (!provider) throw new Error('no subagent provider registered')
 
+      // Read the stored Ticket instead of trusting the in-memory copy: a reply may have added
+      // journal entries after this Ticket was queued, and a person may have cancelled it. The
+      // Executor prompt and the dispatch decision must both be based on what the store says now.
+      const queued = await storeLock(async () => {
+        const store = await readStore()
+        const row = store.tickets.find(t => t.id === ticket.id)
+        if (!row) return null
+        if (row.status !== 'open' || row.assignment?.status === 'cancelled') return null
+        return { text: row.text, title: row.title, thread: row.thread, journal: row.journal ?? [] }
+      })
+      if (!queued) return
+
       // Two kinds of memory reach the Executor: lessons kept across Tickets, and this
       // Ticket's own journal. Neither lives in a Session, so a fresh Executor still has them.
       const longTerm = (await readMemories()).memories
-      const prompt = [renderMemories(longTerm, ticket), renderMemory(ticket), ticket.text]
+      const prompt = [renderMemories(longTerm, queued), renderMemory(queued), queued.text]
         .filter(Boolean).join('\n')
       const activation = await subagents.startActivation({
         provider,
@@ -300,8 +328,25 @@ export function apply(ctx, config = {}) {
       // as an unhandled rejection and kill the process.
       activation.result?.catch?.(() => {})
 
-      live.set(ticket.id, { parent, childId: String(activation.childId) })
-      await patch({ assignment: { executor: String(activation.childId), status: 'running', started_at: new Date().toISOString() } })
+      const childId = String(activation.childId)
+      live.set(ticket.id, { parent, childId })
+      // The cancel path needs a child id to interrupt, so a cancel that lands while the provider
+      // is still starting the Executor can only be observed here. Check and claim the Assignment
+      // in one lock: if the Ticket was withdrawn in the meantime, leave its ended/cancelled
+      // state alone and stop the child that the dispatch already started.
+      const started = await storeLock(async () => {
+        const store = await readStore()
+        const row = store.tickets.find(t => t.id === ticket.id)
+        if (!row) return false
+        if (row.status !== 'open' || row.assignment?.status === 'cancelled') return false
+        row.assignment = { executor: childId, status: 'running', started_at: new Date().toISOString() }
+        await writeStore(store)
+        return true
+      })
+      if (!started) {
+        try { subagents.interrupt(childId, { kind: 'ancestor', agent: parent }) } catch {}
+        return
+      }
 
       // A stuck Executor would hold its concurrency slot forever. Time it out, interrupt the
       // child, and let the retry/failure path below decide what the Ticket becomes.
@@ -356,8 +401,8 @@ export function apply(ctx, config = {}) {
       if (!live) return
 
       const attempts = (ticket._attempts ?? 0) + 1
-      // patch() only writes the stored row; keep this in-memory copy in step or the next
-      // attempt would restart the counter and retry forever.
+      // The retry writes the counter to the stored row; keep this in-memory copy in step or the
+      // next attempt would restart the counter and retry forever.
       ticket._attempts = attempts
       if (attempts <= maxRetries) {
         // Keep the same Ticket and Mandate; only the Assignment is retried.
@@ -571,12 +616,24 @@ export function apply(ctx, config = {}) {
         const ticket = store.tickets.find(t => t.id === args.ticket_id)
         if (!ticket) return { error: 'not_found', ticket_id: args.ticket_id }
 
+        // Nothing is left to withdraw: the Ticket already ended with a terminal Assignment.
+        // Cancelling it now would replace the Executor's report (the record of work that
+        // actually happened) with a cancel marker, so leave the finished Ticket untouched.
+        const alreadyEnded = ticket.status === 'ended'
+          && (!ticket.assignment || ['ended', 'failed', 'cancelled'].includes(ticket.assignment.status))
+        if (alreadyEnded) {
+          return { ticket_id: ticket.id, status: 'ended', was_queued: false, interrupted: false, already_ended: true }
+        }
+
         // Drop it from the queue first: a queued Ticket has no Executor to interrupt.
         // Match by id, not identity: the store object and the queued object are different
         // copies, so indexOf(ticket) would never find a queued row.
         const queued = pending.findIndex(t => t.id === ticket.id)
         const wasQueued = queued >= 0
-        if (wasQueued) pending.splice(queued, 1)
+        if (wasQueued) {
+          pending.splice(queued, 1)
+          inFlight.delete(ticket.id)
+        }
 
         const entry = live.get(ticket.id)
         let interrupted = false
@@ -798,7 +855,7 @@ export function apply(ctx, config = {}) {
         if (!needle) return true
         const haystack = `${memory.text} ${(memory.tags ?? []).join(' ')}`.toLowerCase()
         return haystack.includes(needle)
-      })
+      }).sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')))
       return { total: state.memories.length, matched: rows.length, memories: rows.slice(0, args.limit ?? 20) }
     },
   })
@@ -878,7 +935,7 @@ export function apply(ctx, config = {}) {
         }
         if (!state || state === 'pending' || state === 'running' || state === 'interrupted') {
           ticket.assignment = { ...(ticket.assignment ?? {}), executor: null, status: 'pending', started_at: now }
-          pending.push(ticket)
+          queueTicket(ticket)
           requeued++
         }
       }
