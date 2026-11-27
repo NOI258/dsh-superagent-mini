@@ -2,7 +2,9 @@
 
 想要的效果：丢一个请求进来，agent 自己开个子会话去干，干完回来说一声。DSH 自带的 `subagent` 是一次性的，回来就结束，没法「同一件事接着聊」。所以写了这个。
 
-领域模型来自 [`deepseek-ai/dsh-superagent-prototype`](https://github.com/deepseek-ai/dsh-superagent-prototype)（MIT，24k stars）。那边是分层完整的实现，我把它压成一个文件，加了长期记忆。
+设计上参考了 [`deepseek-ai/dsh-superagent-prototype`](https://github.com/deepseek-ai/dsh-superagent-prototype)（MIT）的分层模型——Trigger / Ticket / Mandate 那套术语，和几条不可变规则。
+
+代码是自己写的，压成了一个文件，另外加了长期记忆和落盘并发锁。借鉴过来的代码片段在 LICENSE 里注明了。
 
 ---
 
