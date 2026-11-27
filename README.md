@@ -92,11 +92,33 @@ node test/smoke.mjs
 node test/resilience.mjs
 node test/consistency.mjs
 node test/regressions.mjs
+node test/stress.mjs              # 全套压测，约 3 分钟
+node test/stress.mjs S2 S7        # 只跑指定场景
 ```
 
-四个都是独立进程、临时 store，不碰真实数据。`resilience` 跑超时和重试，`consistency` 跑 Trigger 幂等、Memory 并发写、取消打断重试，`regressions` 是每次修完 bug 往里加的防回归用例（取消落在启动窗口、同票双 Executor、排队时 reply 丢失、取消毁掉完成报告等）。
+功能测试都是独立进程、临时 store，不碰真实数据。`resilience` 跑超时和重试，`consistency` 跑 Trigger 幂等、Memory 并发写、取消打断重试，`regressions` 是每次修完 bug 往里加的防回归用例（取消落在启动窗口、同票双 Executor、排队时 reply 丢失、取消毁掉完成报告等），`stress` 是负载测试。
 
 新写用例时注意：断言要能描述「修好之后应该成立」的那一侧，然后拿旧代码跑一遍确认它会 FAIL。只验证「全绿」等于没验证——2026-11-27 那轮 7 处修复，旧代码下正好 7 个断言失败，恢复后全绿，这才说明测试真的在测东西。
+
+## 压测
+
+`node test/stress.mjs` 七个场景：洪峰 400 条、慢执行器、永不完成 + 超时、dispatch/cancel 交错、执行器全抛错、混合负载，以及三个规模的吞吐基线。每个场景一个**子进程**——`STORE_FILE` 是模块级常量，同一进程里换 `DSH_SUPERAGENT_MINI_DIR` 不生效，不隔离就全写进同一个 store。
+
+实测（骁龙 4 Gen 2 + proot Ubuntu，Node v24）：
+
+| 规模 | 总耗时 | 单条 | store |
+|---|---|---|---|
+| 50 条 | 3.6 s | 71.7 ms | 48 KB |
+| 150 条 | 13.2 s | 87.9 ms | 145 KB |
+| 300 条 | 27.0 s | 90.0 ms | 290 KB |
+
+**每条 Ticket 的完整生命周期约 70–90 ms，和 Executor 快慢基本无关。** 一个 20 ms 就能跑完的执行器，端到端也要 30 ms 以上（S2：160 条 / 并发 8 / executor 20 ms → 5.4 s）。原因是每个状态变更都在**重写整份 `tickets.json`**：一次 dispatch 一次完成，两次全量写。300 条时平均文件 145 KB，600 次写 ≈ 87 MB IO，这是耗时的主体。
+
+所以吞吐上限约 **11 条/秒**，与执行器无关。对小批量请求（一次丢几条进来让它自己跑）完全够用；一次性灌几百条会明显排队。
+
+并发的部分没问题：`maxConcurrent=8` 时峰值就是 8，闸门没有失效。
+
+**这个写放大没修**：修法有得选（写去抖、完成时只追加 journal、归档已结束的 ticket），但没有一个是小改动，会动存储层的正确性。当前优先级下先量出来记在这里。
 
 ## 运行环境
 
@@ -111,7 +133,7 @@ node test/regressions.mjs
 
 Android 版本、SoC 型号、整机容量在容器里查不到（没有 `getprop`），这部分按机主说明。
 
-三个测试文件只依赖 Node 标准库（`node:zlib`、`node:child_process`），每个场景跑在独立子进程和临时 store 里，不碰真实数据。同样，只有这套环境是实测过的。
+五个测试文件只依赖 Node 标准库（`node:zlib`、`node:child_process`、`node:fs`），每个场景跑在独立子进程和临时 store 里，不碰真实数据。只有这套环境是实测过的。
 
 ## License
 
