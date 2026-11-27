@@ -1,5 +1,7 @@
 # dsh-superagent-mini
 
+> 最后更新：2026-11-27 22:38 · 版本 v0.1.0（tag 在 `a63878d`）· 本轮：11 个工具合并为 4 个，schema 5974 → 4347 字节
+
 想要的效果：丢一个请求进来，agent 自己开个子会话去干，干完回来说一声。DSH 自带的 `subagent` 是一次性的，回来就结束，没法「同一件事接着聊」。所以写了这个。
 
 设计上参考了 [`deepseek-ai/dsh-superagent-prototype`](https://github.com/deepseek-ai/dsh-superagent-prototype)（MIT）的分层模型——Trigger / Ticket / Mandate 那套术语，和几条不可变规则。
