@@ -118,9 +118,9 @@ async function runScenario(name) {
     // Ten concurrent writers on one file. Without a lock they all read the same snapshot and
     // the last rename wins, silently dropping the other nine lessons.
     apply(ctx, { autoDispatch: false })
-    const remember = tools.get('superagent_remember')
+    const remember = tools.get('superagent_memory')
     await Promise.all(Array.from({ length: 10 }, (_, i) =>
-      remember.execute({ text: `lesson number ${i}`, tags: ['concurrency'], scope: 't' })))
+      remember.execute({ action: 'remember', text: `lesson number ${i}`, tags: ['concurrency'], scope: 't' })))
     const state = await readMemories()
     check('all ten memories persisted', state.memories.length === 10, `stored: ${state.memories.length}`)
     const distinct = new Set(state.memories.map(m => m.text)).size
@@ -135,8 +135,8 @@ async function runScenario(name) {
     const accepted = await request.execute({ text: 'cancel me', sender: 'u', title: 'cancel me' })
     const ticketId = accepted.ticket?.ticket_id
     await sleep(200) // first attempt failed; retry is now pending
-    const cancel = tools.get('superagent_cancel')
-    const cancelled = await cancel.execute({ ticket_id: ticketId, reason: 'changed my mind' })
+    const cancel = tools.get('superagent_ticket')
+    const cancelled = await cancel.execute({ action: 'cancel', ticket_id: ticketId, reason: 'changed my mind' })
     check('cancel accepted', cancelled.status === 'ended', cancelled.status)
     await sleep(1_500) // past the 1s backoff
     check('retry never ran', activations === 1, `activations: ${activations}`)
@@ -152,7 +152,7 @@ async function runScenario(name) {
     // rejection as a retryable error and overwrite the withdraw.
     apply(ctx, { autoDispatch: true, maxConcurrent: 1, startupDelayMs: 0, executorTimeoutMs: 60_000, maxRetries: 1 })
     const request = tools.get('superagent_request')
-    const cancel = tools.get('superagent_cancel')
+    const cancel = tools.get('superagent_ticket')
     const accepted = await request.execute({ text: 'cancel while running', sender: 'u', title: 'running' })
     const ticketId = accepted.ticket?.ticket_id
     // execute() returns as soon as the Ticket is queued; the pump starts the Executor on the
@@ -166,7 +166,7 @@ async function runScenario(name) {
     }, 3_000)
     check('assignment reached running', running, running ? 'running' : 'never became running')
 
-    const cancelled = await cancel.execute({ ticket_id: ticketId, reason: 'stop while running' })
+    const cancelled = await cancel.execute({ action: 'cancel', ticket_id: ticketId, reason: 'stop while running' })
     check('cancel accepted', cancelled.status === 'ended', cancelled.status)
     check('executor was interrupted', interrupted.length === 1, `interrupt calls: ${interrupted.length}`)
 

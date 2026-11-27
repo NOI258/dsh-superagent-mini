@@ -114,13 +114,13 @@ async function runScenario(name) {
       autoDispatch: true, maxConcurrent: 1, startupDelayMs: 0, executorTimeoutMs: 60_000, maxRetries: 0,
     })
     const request = tools.get('superagent_request')
-    const cancel = tools.get('superagent_cancel')
+    const cancel = tools.get('superagent_ticket')
     const accepted = await request.execute({ text: 'cancel me while starting', sender: 'u', title: 'starting' })
     const ticketId = accepted.ticket?.ticket_id
     const started = await waitFor(async () => activations === 1, 2_000)
     check('executor start was requested', started, `activations: ${activations}`)
 
-    const cancelled = await cancel.execute({ ticket_id: ticketId, reason: 'withdraw during startup' })
+    const cancelled = await cancel.execute({ action: 'cancel', ticket_id: ticketId, reason: 'withdraw during startup' })
     check('cancel accepted', cancelled.status === 'ended', cancelled.status)
 
     openGate?.()
@@ -160,7 +160,7 @@ async function runScenario(name) {
       autoDispatch: true, maxConcurrent: 2, startupDelayMs: 0, executorTimeoutMs: 60_000, maxRetries: 0,
     })
     const request = tools.get('superagent_request')
-    const reply = tools.get('superagent_reply')
+    const reply = tools.get('superagent_ticket')
     await request.execute({ text: 'blocker one', sender: 'u', title: 'blocker one' })
     await request.execute({ text: 'blocker two', sender: 'u', title: 'blocker two' })
     const bothStarted = await waitFor(async () => activations === 2, 2_000)
@@ -168,7 +168,7 @@ async function runScenario(name) {
 
     const third = await request.execute({ text: 'third request', sender: 'u', title: 'third' })
     const thirdId = third.ticket?.ticket_id
-    const replied = await reply.execute({ ticket_id: thirdId, text: 'also translate the LICENSE' })
+    const replied = await reply.execute({ action: 'reply', ticket_id: thirdId, text: 'also translate the LICENSE' })
     check('reply recorded', replied.ticket_id === thirdId, replied.outcome)
 
     releases.get('blocker one')?.()
@@ -191,12 +191,12 @@ async function runScenario(name) {
     // superagent_recall says "newest first". Two lessons written in order must come back with
     // the later one first; insertion order answers oldest first.
     apply(ctxFor({ list: () => [], startActivation: async () => ({ childId: 'x', result: Promise.resolve({ output: [] }) }), interrupt: () => {} }), { autoDispatch: false })
-    const remember = tools.get('superagent_remember')
-    const recall = tools.get('superagent_recall')
-    await remember.execute({ text: 'older lesson' })
+    const remember = tools.get('superagent_memory')
+    const recall = tools.get('superagent_memory')
+    await remember.execute({ action: 'remember', text: 'older lesson' })
     await sleep(10)
-    await remember.execute({ text: 'newer lesson' })
-    const result = await recall.execute({})
+    await remember.execute({ action: 'remember', text: 'newer lesson' })
+    const result = await recall.execute({ action: 'recall' })
     check('recall returns the newest memory first', result.memories?.[0]?.text === 'newer lesson', result.memories?.map(m => m.text).join(' | '))
   }
 
@@ -284,13 +284,13 @@ async function runScenario(name) {
     }
     apply(ctxFor(subagents), { autoDispatch: true, maxConcurrent: 1, startupDelayMs: 0, executorTimeoutMs: 60_000, maxRetries: 0 })
     const request = tools.get('superagent_request')
-    const cancel = tools.get('superagent_cancel')
+    const cancel = tools.get('superagent_ticket')
     const accepted = await request.execute({ text: 'finish before cancel', sender: 'u', title: 'finished' })
     const ticketId = accepted.ticket?.ticket_id
     const ended = await waitFor(async () => (await findTicket(ticketId))?.status === 'ended', 2_000)
     check('ticket finished before the cancel', ended)
 
-    await cancel.execute({ ticket_id: ticketId, reason: 'too late' })
+    await cancel.execute({ action: 'cancel', ticket_id: ticketId, reason: 'too late' })
     const ticket = await findTicket(ticketId)
     check('finished report is preserved', ticket.report?.stop_reason === 'done', String(ticket.report?.stop_reason))
     check('finished output is preserved', String(ticket.report?.output ?? '').includes('real finished output'))

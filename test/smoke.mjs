@@ -45,7 +45,7 @@ const check = (name, ok, detail) => {
   if (!ok) failures.push(name)
 }
 
-check('registers 11 tools', tools.size === 11, `got ${tools.size}`)
+check('registers 4 tools', tools.size === 4, `got ${tools.size}`)
 
 // Startup recovery: both seeded Tickets must have been dispatched again.
 check('recovery dispatched running ticket', dispatched.includes('running one'))
@@ -74,7 +74,7 @@ check('burst writes all persisted', afterBurst.tickets.length === 11, `got ${aft
 // Health snapshot reflects runtime state.
 const health = await tools.get('superagent_health').execute({})
 check('health reports store dir', health.store.dir === dir)
-check('health reports 11 tools worth of config', health.config.autoDispatch === true)
+check('health reports store config', health.config.autoDispatch === true)
 console.log('health:', JSON.stringify({ concurrency: health.concurrency, store: health.store }))
 
 console.log(failures.length === 0 ? '\nALL PASS' : `\nFAILED: ${failures.join(', ')}`)

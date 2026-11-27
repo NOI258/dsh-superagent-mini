@@ -545,15 +545,29 @@ export function apply(ctx, config = {}) {
     execute: async (args) => accept(args),
   })
 
+  // Four tools, not eleven. Tool schemas are prompt cost on every turn, so verbs that
+  // share one store collapse into an `action` enum instead of separate registrations.
   ctx.tools.register({
-    name: 'superagent_list',
-    description: 'List super-agent Tickets, newest first, with their status and assignment state.',
+    name: 'superagent_ticket',
+    description: [
+      'Read or move Tickets. action=list (newest first; status/thread filters), show (one Ticket in full),',
+      'journal (its journal: what earlier Executors did, what people added, whether it was cancelled —',
+      'the record a fresh Executor receives as its memory), reply (add a message; an ended Ticket reopens',
+      'under the same Mandate and is dispatched again), cancel (stop it; the only way to withdraw a Mandate —',
+      'a Policy change is delivered, it does not revoke work), team (the board: Threads, askers, running Executors).',
+    ].join(' '),
     parameters: {
       type: 'object',
       properties: {
-        status: { type: 'string', enum: ['open', 'ended'], description: 'Optional filter.' },
-        limit: { type: 'integer', minimum: 1, maximum: 100, default: 20 },
+        action: { type: 'string', enum: ['list', 'show', 'journal', 'reply', 'cancel', 'team'], description: 'What to do. The fields below apply per action.' },
+        ticket_id: { type: 'string', minLength: 1, description: 'show, journal, reply, cancel.' },
+        text: { type: 'string', minLength: 1, description: 'reply: the message to add. Written into the journal, not into a Session.' },
+        reason: { type: 'string', description: 'cancel: why the work stopped, at most 500 characters.' },
+        status: { type: 'string', enum: ['open', 'ended'], description: 'list: optional status filter.' },
+        thread: { type: 'string', description: 'list, team: limit to one Thread.' },
+        limit: { type: 'integer', minimum: 1, maximum: 100, default: 20, description: 'list, journal: how many rows.' },
       },
+      required: ['action'],
       additionalProperties: false,
     },
     output: {
@@ -561,286 +575,165 @@ export function apply(ctx, config = {}) {
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
     execute: async (args = {}) => {
-      const store = await readStore()
-      const rows = store.tickets
-        .filter(t => !args.status || t.status === args.status)
-        .sort((a, b) => b.created_at.localeCompare(a.created_at))
-        .slice(0, args.limit ?? 20)
-      return { total: store.tickets.length, tickets: rows.map(summarize) }
-    },
-  })
-
-  ctx.tools.register({
-    name: 'superagent_show',
-    description: 'Show one Ticket in full: its request, Mandate, Assignment and the Executor report if any.',
-    parameters: {
-      type: 'object',
-      properties: { ticket_id: { type: 'string', minLength: 1 } },
-      required: ['ticket_id'],
-      additionalProperties: false,
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: true },
-      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
-    },
-    execute: async (args) => {
-      const store = await readStore()
-      const ticket = store.tickets.find(t => t.id === args.ticket_id)
-      if (!ticket) return { error: 'not_found', ticket_id: args.ticket_id }
-      return ticket
-    },
-  })
-
-  ctx.tools.register({
-    name: 'superagent_cancel',
-    description: [
-      'Cancel one Ticket. Stops its Executor and marks the Ticket ended.',
-      'This is the only way to withdraw a Mandate: a Policy change is delivered to the Executor, it does not revoke work.',
-    ].join(' '),
-    parameters: {
-      type: 'object',
-      properties: {
-        ticket_id: { type: 'string', minLength: 1 },
-        reason: { type: 'string', description: 'Why the work stopped, at most 500 characters.' },
-      },
-      required: ['ticket_id'],
-      additionalProperties: false,
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: true },
-      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
-    },
-    execute: async (args) => {
-      return storeLock(async () => {
-        const store = await readStore()
-        const ticket = store.tickets.find(t => t.id === args.ticket_id)
-        if (!ticket) return { error: 'not_found', ticket_id: args.ticket_id }
-
-        // Nothing is left to withdraw: the Ticket already ended with a terminal Assignment.
-        // Cancelling it now would replace the Executor's report (the record of work that
-        // actually happened) with a cancel marker, so leave the finished Ticket untouched.
-        const alreadyEnded = ticket.status === 'ended'
-          && (!ticket.assignment || ['ended', 'failed', 'cancelled'].includes(ticket.assignment.status))
-        if (alreadyEnded) {
-          return { ticket_id: ticket.id, status: 'ended', was_queued: false, interrupted: false, already_ended: true }
+      switch (args.action) {
+        case 'list': {
+          const store = await readStore()
+          const rows = store.tickets
+            .filter(t => !args.status || t.status === args.status)
+            .filter(t => !args.thread || t.thread === args.thread)
+            .sort((a, b) => b.created_at.localeCompare(a.created_at))
+            .slice(0, args.limit ?? 20)
+          return { total: store.tickets.length, tickets: rows.map(summarize) }
         }
 
-        // Drop it from the queue first: a queued Ticket has no Executor to interrupt.
-        // Match by id, not identity: the store object and the queued object are different
-        // copies, so indexOf(ticket) would never find a queued row.
-        const queued = pending.findIndex(t => t.id === ticket.id)
-        const wasQueued = queued >= 0
-        if (wasQueued) {
-          pending.splice(queued, 1)
-          inFlight.delete(ticket.id)
+        case 'show': {
+          const store = await readStore()
+          const ticket = store.tickets.find(t => t.id === args.ticket_id)
+          if (!ticket) return { error: 'not_found', ticket_id: args.ticket_id }
+          return ticket
         }
 
-        const entry = live.get(ticket.id)
-        let interrupted = false
-        if (entry) {
-          const subagents = ctx.get('subagents')
-          if (subagents) {
-            try {
-              subagents.interrupt(entry.childId, { kind: 'ancestor', agent: entry.parent })
-              interrupted = true
-            } catch (error) {
-              ticket.cancel_error = String(error?.message ?? error)
-            }
+        case 'journal': {
+          const store = await readStore()
+          const ticket = store.tickets.find(t => t.id === args.ticket_id)
+          if (!ticket) return { error: 'not_found', ticket_id: args.ticket_id }
+          const all = ticket.journal ?? []
+          return {
+            ticket_id: ticket.id,
+            status: ticket.status,
+            entries: all.length,
+            journal: all.slice(-(args.limit ?? 20)),
+            prompt_preview: renderMemory(ticket),
           }
         }
 
-        ticket.status = 'ended'
-        ticket.assignment = { ...(ticket.assignment ?? {}), status: 'cancelled', ended_at: new Date().toISOString() }
-        ticket.report = { stop_reason: 'cancelled', output: '', reason: args.reason ?? null, interrupted }
-        await writeStore(store)
-        return { ticket_id: ticket.id, status: 'ended', was_queued: wasQueued, interrupted }
-      })
-    },
-  })
+        case 'reply': {
+          return storeLock(async () => {
+            const store = await readStore()
+            const ticket = store.tickets.find(t => t.id === args.ticket_id)
+            if (!ticket) return { error: 'not_found', ticket_id: args.ticket_id }
 
-  ctx.tools.register({
-    name: 'superagent_team',
-    description: [
-      'Show the team board: every Thread with its open Tickets, who asked, and which Executors are running.',
-      'Use this instead of listing all Tickets when several people are asking at once.',
-    ].join(' '),
-    parameters: {
-      type: 'object',
-      properties: {
-        thread: { type: 'string', description: 'Limit the board to one Thread.' },
-      },
-      additionalProperties: false,
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: true },
-      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
-    },
-    execute: async (args = {}) => {
-      const store = await readStore()
-      const rows = store.tickets.filter(t => !args.thread || t.thread === args.thread)
-      const byThread = new Map()
-      for (const ticket of rows) {
-        const list = byThread.get(ticket.thread) ?? []
-        list.push({
-          ticket_id: ticket.id,
-          title: ticket.title,
-          sender: ticket.sender,
-          status: ticket.status,
-          assignment: ticket.assignment?.status ?? 'none',
-          executor: ticket.assignment?.executor ?? null,
-        })
-        byThread.set(ticket.thread, list)
-      }
-      return {
-        concurrency: { running: runningCount, queued: pending.length, limit: maxConcurrent },
-        threads: [...byThread.entries()].map(([thread, tickets]) => ({
-          thread,
-          open: tickets.filter(t => t.status === 'open').length,
-          tickets,
-        })),
-      }
-    },
-  })
+            ticket.journal ??= []
+            ticket.journal.push({ at: new Date().toISOString(), kind: 'reply', text: args.text })
+            if (ticket.journal.length > MAX_JOURNAL_ENTRIES) ticket.journal = ticket.journal.slice(-MAX_JOURNAL_ENTRIES)
 
-  ctx.tools.register({
-    name: 'superagent_reply',
-    description: [
-      'Add a message to an existing Ticket. This is how work continues across conversations:',
-      'the Ticket id is stable, so a later session can resume it without re-stating the request.',
-      'An ended Ticket reopens and is dispatched again with its journal; a running one records the message and picks it up on the next dispatch.',
-    ].join(' '),
-    parameters: {
-      type: 'object',
-      properties: {
-        ticket_id: { type: 'string', minLength: 1 },
-        text: { type: 'string', minLength: 1, description: 'What to add. Written into the Ticket journal, not into a Session.' },
-      },
-      required: ['ticket_id', 'text'],
-      additionalProperties: false,
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: true },
-      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
-    },
-    execute: async (args) => {
-      return storeLock(async () => {
-        const store = await readStore()
-        const ticket = store.tickets.find(t => t.id === args.ticket_id)
-        if (!ticket) return { error: 'not_found', ticket_id: args.ticket_id }
+            const running = ticket.assignment?.status === 'running'
+            if (running) {
+              // A live Executor keeps its own turn; the message joins the record for the next dispatch.
+              await writeStore(store)
+              return { ticket_id: ticket.id, outcome: 'recorded', note: 'a live Executor is running; this applies on its next dispatch' }
+            }
 
-        ticket.journal ??= []
-        ticket.journal.push({ at: new Date().toISOString(), kind: 'reply', text: args.text })
-        if (ticket.journal.length > MAX_JOURNAL_ENTRIES) ticket.journal = ticket.journal.slice(-MAX_JOURNAL_ENTRIES)
-
-        const running = ticket.assignment?.status === 'running'
-        if (running) {
-          // A live Executor keeps its own turn; the message joins the record for the next dispatch.
-          await writeStore(store)
-          return { ticket_id: ticket.id, outcome: 'recorded', note: 'a live Executor is running; this applies on its next dispatch' }
+            // Reopen under the same Mandate: a person's message resumes the Ticket, it does not
+            // create a new authorization. Only a person's stop withdraws a Mandate.
+            ticket.status = 'open'
+            ticket.assignment = { executor: null, status: 'pending', started_at: new Date().toISOString() }
+            await writeStore(store)
+            enqueue(ticket)
+            return { ticket_id: ticket.id, outcome: 'redispatched', journal_entries: ticket.journal.length }
+          })
         }
 
-        // Reopen under the same Mandate: a person's message resumes the Ticket, it does not
-        // create a new authorization. Only a person's stop withdraws a Mandate.
-        ticket.status = 'open'
-        ticket.assignment = { executor: null, status: 'pending', started_at: new Date().toISOString() }
-        await writeStore(store)
-        enqueue(ticket)
-        return { ticket_id: ticket.id, outcome: 'redispatched', journal_entries: ticket.journal.length }
-      })
+        case 'cancel': {
+          return storeLock(async () => {
+            const store = await readStore()
+            const ticket = store.tickets.find(t => t.id === args.ticket_id)
+            if (!ticket) return { error: 'not_found', ticket_id: args.ticket_id }
+
+            // Nothing is left to withdraw: the Ticket already ended with a terminal Assignment.
+            // Cancelling it now would replace the Executor's report (the record of work that
+            // actually happened) with a cancel marker, so leave the finished Ticket untouched.
+            const alreadyEnded = ticket.status === 'ended'
+              && (!ticket.assignment || ['ended', 'failed', 'cancelled'].includes(ticket.assignment.status))
+            if (alreadyEnded) {
+              return { ticket_id: ticket.id, status: 'ended', was_queued: false, interrupted: false, already_ended: true }
+            }
+
+            // Drop it from the queue first: a queued Ticket has no Executor to interrupt.
+            // Match by id, not identity: the store object and the queued object are different
+            // copies, so indexOf(ticket) would never find a queued row.
+            const queued = pending.findIndex(t => t.id === ticket.id)
+            const wasQueued = queued >= 0
+            if (wasQueued) {
+              pending.splice(queued, 1)
+              inFlight.delete(ticket.id)
+            }
+
+            const entry = live.get(ticket.id)
+            let interrupted = false
+            if (entry) {
+              const subagents = ctx.get('subagents')
+              if (subagents) {
+                try {
+                  subagents.interrupt(entry.childId, { kind: 'ancestor', agent: entry.parent })
+                  interrupted = true
+                } catch (error) {
+                  ticket.cancel_error = String(error?.message ?? error)
+                }
+              }
+            }
+
+            ticket.status = 'ended'
+            ticket.assignment = { ...(ticket.assignment ?? {}), status: 'cancelled', ended_at: new Date().toISOString() }
+            ticket.report = { stop_reason: 'cancelled', output: '', reason: args.reason ?? null, interrupted }
+            await writeStore(store)
+            return { ticket_id: ticket.id, status: 'ended', was_queued: wasQueued, interrupted }
+          })
+        }
+
+        case 'team': {
+          const store = await readStore()
+          const rows = store.tickets.filter(t => !args.thread || t.thread === args.thread)
+          const byThread = new Map()
+          for (const ticket of rows) {
+            const list = byThread.get(ticket.thread) ?? []
+            list.push({
+              ticket_id: ticket.id,
+              title: ticket.title,
+              sender: ticket.sender,
+              status: ticket.status,
+              assignment: ticket.assignment?.status ?? 'none',
+              executor: ticket.assignment?.executor ?? null,
+            })
+            byThread.set(ticket.thread, list)
+          }
+          return {
+            concurrency: { running: runningCount, queued: pending.length, limit: maxConcurrent },
+            threads: [...byThread.entries()].map(([thread, tickets]) => ({
+              thread,
+              open: tickets.filter(t => t.status === 'open').length,
+              tickets,
+            })),
+          }
+        }
+
+        default:
+          return { error: 'bad_action', action: args.action ?? null, allowed: ['list', 'show', 'journal', 'reply', 'cancel', 'team'] }
+      }
     },
   })
 
   ctx.tools.register({
     name: 'superagent_memory',
     description: [
-      'Show a Ticket journal: what earlier Executors did, what people added, and whether it was ever cancelled.',
-      'This is the record a fresh Executor receives as its memory — durable in the store, not in any Session context.',
+      'Long-term memory that outlives any Ticket and reaches later Executors. action=remember (keep one',
+      'durable lesson — a convention, a preference, a pitfall already hit; same text updates the same entry),',
+      'recall (scope plus tag/text overlap, newest first, no embeddings; an empty answer is a real answer —',
+      'this store only holds what someone chose to write down), forget (delete by id; a stale memory nobody',
+      'deletes is worse than no memory).',
     ].join(' '),
     parameters: {
       type: 'object',
       properties: {
-        ticket_id: { type: 'string', minLength: 1 },
-        limit: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
+        action: { type: 'string', enum: ['remember', 'recall', 'forget'], description: 'What to do. The fields below apply per action.' },
+        text: { type: 'string', minLength: 1, description: 'remember: one self-contained sentence or short paragraph.' },
+        tags: { type: 'array', items: { type: 'string' }, description: 'remember: words that should make this relevant again.' },
+        scope: { type: 'string', description: 'remember, recall: a Thread name, or omit for global.' },
+        query: { type: 'string', description: 'recall: words to match against memory text and tags.' },
+        id: { type: 'string', minLength: 1, description: 'forget: memory id.' },
+        limit: { type: 'integer', minimum: 1, maximum: 50, default: 20, description: 'recall: how many to return.' },
       },
-      required: ['ticket_id'],
-      additionalProperties: false,
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: true },
-      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
-    },
-    execute: async (args) => {
-      const store = await readStore()
-      const ticket = store.tickets.find(t => t.id === args.ticket_id)
-      if (!ticket) return { error: 'not_found', ticket_id: args.ticket_id }
-      const all = ticket.journal ?? []
-      return {
-        ticket_id: ticket.id,
-        status: ticket.status,
-        entries: all.length,
-        journal: all.slice(-(args.limit ?? 20)),
-        prompt_preview: renderMemory(ticket),
-      }
-    },
-  })
-
-  ctx.tools.register({
-    name: 'superagent_remember',
-    description: [
-      'Keep one durable lesson in long-term memory. It outlives the Ticket and reaches later Executors.',
-      'Write a conclusion, not a transcript: a convention, a preference, a pitfall already hit.',
-      'Use scope for a lesson that only applies to one Thread; omit it for a global one.',
-    ].join(' '),
-    parameters: {
-      type: 'object',
-      properties: {
-        text: { type: 'string', minLength: 1, description: 'One self-contained sentence or short paragraph.' },
-        tags: {
-          type: 'array', items: { type: 'string' },
-          description: 'Words that should make this memory relevant again, matched against later Ticket text.',
-        },
-        scope: { type: 'string', description: 'A Thread name this applies to, or omit for global.' },
-      },
-      required: ['text'],
-      additionalProperties: false,
-    },
-    output: {
-      schema: { type: 'object', additionalProperties: true },
-      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
-    },
-    execute: async (args) => memoryLock(async () => {
-      const state = await readMemories()
-      const id = `m-${createHash('sha256').update(args.text).digest('hex').slice(0, 10)}`
-      // Same text means the same lesson: update it instead of keeping two copies.
-      const existing = state.memories.findIndex(m => m.id === id)
-      const record = {
-        id,
-        text: args.text,
-        tags: args.tags ?? [],
-        scope: args.scope ?? 'global',
-        created_at: new Date().toISOString(),
-        used: existing >= 0 ? state.memories[existing].used ?? 0 : 0,
-      }
-      if (existing >= 0) state.memories[existing] = record
-      else state.memories.push(record)
-      await writeMemories(state)
-      return { id, updated: existing >= 0, total: state.memories.length }
-    }),
-  })
-
-  ctx.tools.register({
-    name: 'superagent_recall',
-    description: [
-      'Search long-term memory. Matching is scope plus tag/text overlap, newest first — no embeddings.',
-      'An empty answer is a real answer: this store only holds what someone chose to write down.',
-    ].join(' '),
-    parameters: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', description: 'Words to match against memory text and tags.' },
-        scope: { type: 'string', description: 'Limit to one Thread scope.' },
-        limit: { type: 'integer', minimum: 1, maximum: 50, default: 20 },
-      },
+      required: ['action'],
       additionalProperties: false,
     },
     output: {
@@ -848,39 +741,55 @@ export function apply(ctx, config = {}) {
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
     execute: async (args = {}) => {
-      const state = await readMemories()
-      const needle = String(args.query ?? '').toLowerCase()
-      const rows = state.memories.filter(memory => {
-        if (args.scope && memory.scope !== args.scope) return false
-        if (!needle) return true
-        const haystack = `${memory.text} ${(memory.tags ?? []).join(' ')}`.toLowerCase()
-        return haystack.includes(needle)
-      }).sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')))
-      return { total: state.memories.length, matched: rows.length, memories: rows.slice(0, args.limit ?? 20) }
-    },
-  })
+      switch (args.action) {
+        case 'remember': {
+          return memoryLock(async () => {
+            const state = await readMemories()
+            const id = `m-${createHash('sha256').update(args.text).digest('hex').slice(0, 10)}`
+            // Same text means the same lesson: update it instead of keeping two copies.
+            const existing = state.memories.findIndex(m => m.id === id)
+            const record = {
+              id,
+              text: args.text,
+              tags: args.tags ?? [],
+              scope: args.scope ?? 'global',
+              created_at: new Date().toISOString(),
+              used: existing >= 0 ? state.memories[existing].used ?? 0 : 0,
+            }
+            if (existing >= 0) state.memories[existing] = record
+            else state.memories.push(record)
+            await writeMemories(state)
+            return { id, updated: existing >= 0, total: state.memories.length }
+          })
+        }
 
-  ctx.tools.register({
-    name: 'superagent_forget',
-    description: 'Delete one long-term memory by id. A stale memory that nobody deletes is worse than no memory.',
-    parameters: {
-      type: 'object',
-      properties: { id: { type: 'string', minLength: 1 } },
-      required: ['id'],
-      additionalProperties: false,
+        case 'recall': {
+          const state = await readMemories()
+          const needle = String(args.query ?? '').toLowerCase()
+          const rows = state.memories.filter(memory => {
+            if (args.scope && memory.scope !== args.scope) return false
+            if (!needle) return true
+            const haystack = `${memory.text} ${(memory.tags ?? []).join(' ')}`.toLowerCase()
+            return haystack.includes(needle)
+          }).sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')))
+          return { total: state.memories.length, matched: rows.length, memories: rows.slice(0, args.limit ?? 20) }
+        }
+
+        case 'forget': {
+          return memoryLock(async () => {
+            const state = await readMemories()
+            const before = state.memories.length
+            state.memories = state.memories.filter(m => m.id !== args.id)
+            if (state.memories.length === before) return { error: 'not_found', id: args.id }
+            await writeMemories(state)
+            return { id: args.id, deleted: true, remaining: state.memories.length }
+          })
+        }
+
+        default:
+          return { error: 'bad_action', action: args.action ?? null, allowed: ['remember', 'recall', 'forget'] }
+      }
     },
-    output: {
-      schema: { type: 'object', additionalProperties: true },
-      render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
-    },
-    execute: async (args) => memoryLock(async () => {
-      const state = await readMemories()
-      const before = state.memories.length
-      state.memories = state.memories.filter(m => m.id !== args.id)
-      if (state.memories.length === before) return { error: 'not_found', id: args.id }
-      await writeMemories(state)
-      return { id: args.id, deleted: true, remaining: state.memories.length }
-    }),
   })
 
   ctx.tools.register({

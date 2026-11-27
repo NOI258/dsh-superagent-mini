@@ -78,7 +78,7 @@ if (oneFlag) {
     return {
       dir, tools, stats, logs, readStore,
       request: tools.get('superagent_request'),
-      cancel: tools.get('superagent_cancel'),
+      cancel: tools.get('superagent_ticket'),
       close: async () => {
         // 等异步写盘收尾再删，否则 rm 会和 rename 抢（teammate 也踩过同一个坑）
         await sleep(250)
@@ -187,7 +187,7 @@ if (oneFlag) {
       for (let i = 0; i < N; i++) {
         const r = await inst.request.execute({ text: `storm-${i}`, sender: 'u' }).catch(() => null)
         if (r?.ticketId) ids.push(r.ticketId)
-        if (i % 3 === 0 && ids.length) await inst.cancel.execute({ ticket_id: ids[ids.length - 1], reason: 'storm' }).catch(() => null)
+        if (i % 3 === 0 && ids.length) await inst.cancel.execute({ action: 'cancel', ticket_id: ids[ids.length - 1], reason: 'storm' }).catch(() => null)
       }
       const settled = await until(async () => (await inst.readStore()).tickets.every(t => t.status !== 'open'), { timeout: 120_000 })
       const store = await inst.readStore()

@@ -6,9 +6,9 @@
 
 ## 0. 它是什么
 
-一个 Cordis 插件。挂进 DSH 后提供 **11 个 `superagent_*` 工具**，做的是：丢一个请求进来，它开一张票，派一个子会话去干，干完回来说一声。
+一个 Cordis 插件。挂进 DSH 后提供 **4 个 `superagent_*` 工具**，做的是：丢一个请求进来，它开一张票，派一个子会话去干，干完回来说一声。
 
-和 DSH 自带的 `subagent` 的关键差别：**`subagent` 是一次性的，回来就结束；这个能对同一件事接着聊**（`superagent_reply` 追加要求，下次 dispatch 带上）。
+和 DSH 自带的 `subagent` 的关键差别：**`subagent` 是一次性的，回来就结束；这个能对同一件事接着聊**（`superagent_ticket { action: "reply" }` 追加要求，下次 dispatch 带上）。
 
 `package.json` 里 `dsh.bundle.patch` 指向 `cordis.patch.yml`，DSH 靠它把插件插进 composition。
 
@@ -40,7 +40,7 @@ dsh plugin --profile web add github:NOI258/dsh-superagent-mini
 ```
 superagent_request { text: "只回复 ok，不要做其他事", sender: "<你的身份>" }
 → 记下 ticket_id
-superagent_show { ticket_id }
+superagent_ticket { action: "show", ticket_id }
 → 状态应从 open 走到 ended
 ```
 
@@ -48,20 +48,22 @@ superagent_show { ticket_id }
 
 ---
 
-## 2. 十一个工具怎么用
+## 2. 四个工具怎么用
 
-| 用途 | 工具 |
+| 工具 | 用途 |
 |---|---|
-| 提交 | `superagent_request` |
-| 查看 | `superagent_list`、`superagent_show`、`superagent_team`、`superagent_health` |
-| 控制 | `superagent_cancel`、`superagent_reply` |
-| 记忆 | `superagent_memory`、`superagent_remember`、`superagent_recall`、`superagent_forget` |
+| `superagent_request` | 开票：提交一件被授权的工作 |
+| `superagent_ticket` | `action` = `list` / `show` / `journal` / `reply` / `cancel` / `team` |
+| `superagent_memory` | `action` = `remember` / `recall` / `forget`（长期记忆，活得比票久） |
+| `superagent_health` | 循环与存储快照 |
+
+工具 schema 每轮都进 prompt，所以同存储的动词合进一个 `action` 枚举，不拆成独立工具。11 个工具的 `description + parameters` 共 5974 字节，合并后 4347 字节。
 
 ### 最容易搞错的一件事
 
 **`superagent_request` 不返回执行结果。** 它只负责开票和派活，立刻返回 `ticket_id` 和 `decision`（`accept` / `duplicate` / 等）。
 
-要看结果得用 `superagent_show`，要改要求用 `superagent_reply`。**别指望一次调用拿到产出。**
+要看结果得用 `superagent_ticket { action: "show" }`，要改要求用 `{ action: "reply" }`。**别指望一次调用拿到产出。**
 
 ### 状态机
 
@@ -69,7 +71,7 @@ superagent_show { ticket_id }
 - `ended` —— 正常结束，`assignment.report` 里有产出
 - `failed` —— 失败，重试预算耗尽
 
-**票和执行器是两回事。** 执行器崩了票还在；重试是票的事，不是会话的事。所以 `superagent_show` 看到 `open` 不等于它还活着。
+**票和执行器是两回事。** 执行器崩了票还在；重试是票的事，不是会话的事。所以 `superagent_ticket { action: "show" }` 看到 `open` 不等于它还活着。
 
 ---
 
@@ -88,7 +90,7 @@ memory.json    长期记忆
 
 **分开是有意的，清理时也别一起删。** `tickets.json` 随任务结束就没用了；`memory.json` 里的教训要活过每一张产生它的票，删了就没了。
 
-清之前先 `superagent_list { status: "open" }` 确认没有活着的票。
+清之前先 `superagent_ticket { action: "list", status: "open" }` 确认没有活着的票。
 
 ---
 
@@ -96,7 +98,7 @@ memory.json    长期记忆
 
 **吞吐约 11 条/秒，和执行器快慢无关。** 每条 Ticket 端到端 70–90 ms，因为每次状态变更都重写整份 `tickets.json`。实测：400 条要 27 秒；160 条只跑 20 ms 的任务、并发 8，也要 5.4 秒。
 
-→ **一次灌几百条会明显排队。** 分批，每批几十条，用 `superagent_team` 看板子。
+→ **一次灌几百条会明显排队。** 分批，每批几十条，用 `superagent_ticket { action: "team" }` 看板子。
 
 **并发上限默认 2**（`maxConcurrent`）。改的是插件 config，不是运行时参数。峰值并发确实能到配置值，闸门没坏。
 
@@ -114,9 +116,9 @@ memory.json    长期记忆
 
 | 别这样 | 为什么 | 应该这样 |
 |---|---|---|
-| 等 `superagent_request` 的返回值当执行结果 | 它只开票派活 | `superagent_show` 查状态 |
-| 一次提交几百条 | 27 秒起步，且拿不到进度 | 分批 + `superagent_team` |
-| 对已 `ended` 的票再 `superagent_cancel` | 会抹掉完成报告，原输出永久丢失 | 先 `superagent_show` 看状态 |
+| 等 `superagent_request` 的返回值当执行结果 | 它只开票派活 | `superagent_ticket { action: "show" }` 查状态 |
+| 一次提交几百条 | 27 秒起步，且拿不到进度 | 分批 + `superagent_ticket { action: "team" }` |
+| 对已 `ended` 的票再 `action: "cancel"` | 会抹掉完成报告，原输出永久丢失 | 先 `action: "show"` 看状态 |
 | 想改一张票的范围 | Mandate 不可变 | 开新票 |
 | 在测试里同进程起两个实例 | `STORE_FILE` 是模块级常量 | 每场景一个子进程 |
 | 把 ticket 当 session 用 | 票不镜像执行器会话状态 | 票管业务状态，会话管执行 |
@@ -138,7 +140,7 @@ node test/stress.mjs         # 7 个负载场景，约 3 分钟
 排障顺序：
 
 1. `superagent_health` —— **先确认它在读你以为的那个 store**
-2. `superagent_list { status: "open" }` —— 有没有卡住的票
+2. `superagent_ticket { action: "list", status: "open" }` —— 有没有卡住的票
 3. `node test/smoke.mjs` —— 能过说明插件本身没坏，问题在挂载或环境
 4. 全量回归 —— 四个功能测试 + 压测
 

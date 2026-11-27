@@ -15,28 +15,32 @@
 ## 用起来是这样
 
 ```
-superagent_request "把这个仓库的 README 翻译成英文"
+superagent_request { text: "把这个仓库的 README 翻译成英文", sender: "me" }
 → t-3f2a91c  开了一张票，派了执行器
 
-superagent_show  t-3f2a91c
+superagent_ticket { action: "show", ticket_id: "t-3f2a91c" }
 → 看它做到哪一步了
 
-superagent_reply t-3f2a91c "顺便把 LICENSE 也翻了"
+superagent_ticket { action: "reply", ticket_id: "t-3f2a91c", text: "顺便把 LICENSE 也翻了" }
 → 消息进同一张票，执行器下次醒来会看到
 
-superagent_cancel t-3f2a91c
+superagent_ticket { action: "cancel", ticket_id: "t-3f2a91c", reason: "不做了" }
 → 不做了
 ```
 
 票和执行器是两回事。执行器崩了，票还在；重试是票的事，不是会话的事。
 
-## 十一个工具
+## 四个工具
 
-提交和查看：`superagent_request`、`superagent_list`、`superagent_show`、`superagent_team`、`superagent_health`
+**`superagent_request`** — 开票。一张票 = 一件被授权的工作。
 
-控制：`superagent_cancel`、`superagent_reply`
+**`superagent_ticket`** — 六个 action：`list`（按状态/线程列）、`show`（一张票的全部）、`journal`（执行器做过什么、人加了什么）、`reply`（追加消息，已结束的票以同一 mandate 重开）、`cancel`（撤回，唯一能撤销授权的方式）、`team`（看板：线程、谁提的、谁在跑）。
 
-记忆：`superagent_memory`（读某张票的 journal）、`superagent_remember`、`superagent_recall`、`superagent_forget`
+**`superagent_memory`** — 三个 action：`remember` / `recall` / `forget`。长期记忆，活得比票久。
+
+**`superagent_health`** — 循环和存储的快照。
+
+**为什么不是十一个。** 工具 schema 每轮都进 prompt，同存储的动词合并成一个 `action` 枚举比拆成独立工具省。11 个工具的 `description + parameters` 合计 5974 字节，合并后 4347 字节——约 1.9K token 降到 1.4K。这是设计取舍不是省事：合并之后每个 action 能用哪些字段要靠 description 说清，读错就会传错参数。
 
 ## 数据在哪
 
@@ -89,7 +93,7 @@ $DSH_PROFILE_DIR/superagent-mini  否则跟着 profile
 dsh plugin --profile web add github:NOI258/dsh-superagent-mini
 ```
 
-装完重启，十一个 `superagent_*` 工具出现在工具列表里。
+装完重启，四个 `superagent_*` 工具出现在工具列表里。
 
 `package.json` 里的 `dsh.bundle.patch` 指向 `cordis.patch.yml`，DSH 靠这个把插件挂进
 composition。要改配置或换挂载方式，动那个文件，不用关心 npm。
