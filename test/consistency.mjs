@@ -1,18 +1,31 @@
-// Consistency tests: trigger idempotence, memory write ordering, cancel-during-retry.
+// Consistency tests: trigger idempotence, memory write ordering, and cancel races.
 //
 // Each scenario needs its own store, and the store path is resolved at module load, so every
 // case runs in a child process. The parent only spawns and reports.
+//
+// Two cancel scenarios are kept apart on purpose:
+//   cancel-stops-pending-retry        — cancel lands while a retry is waiting in backoff
+//   cancel-during-running-executor    — cancel lands while an Executor holds the Ticket,
+//                                       and the Executor's failure arrives after the cancel
+// They fail for different reasons and one cannot stand in for the other.
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const self = fileURLToPath(import.meta.url)
 const scenario = process.argv[2]
 
+const SCENARIOS = [
+  'rejected-trigger-is-idempotent',
+  'memory-writes-do-not-collide',
+  'cancel-stops-pending-retry',
+  'cancel-during-running-executor',
+]
+
 if (scenario) {
   await runScenario(scenario)
 } else {
   let failed = 0
-  for (const name of ['rejected-trigger-is-idempotent', 'memory-writes-do-not-collide', 'cancel-stops-pending-retry']) {
+  for (const name of SCENARIOS) {
     const code = await new Promise((resolve) => {
       const child = spawn(process.execPath, [self, name], { stdio: 'inherit' })
       child.on('exit', resolve)
@@ -40,17 +53,32 @@ async function runScenario(name) {
 
   const tools = new Map()
   let activations = 0
+  const interrupted = []
+  // Rejects on a later tick: dispatchTicket awaits a store patch before it can attach a
+  // handler to result, and an already-rejected promise would surface as unhandled.
   const failLater = (message) => new Promise((_, reject) => {
     setTimeout(() => reject(new Error(message)), 0)
   })
+  // Set only while a scenario wants a pending Executor it can interrupt from the outside.
+  let rejectLive = null
 
   const subagents = {
     list: () => ['mock-provider'],
     startActivation: async () => {
       activations++
-      return { childId: `child-${activations}`, result: failLater(`boom #${activations}`) }
+      const childId = `child-${activations}`
+      if (name === 'cancel-during-running-executor') {
+        // A real Executor runs until something stops it. The test stops it through interrupt.
+        const result = new Promise((_, reject) => { rejectLive = reject })
+        return { childId, result }
+      }
+      return { childId, result: failLater(`boom #${activations}`) }
     },
-    interrupt: () => {},
+    interrupt: (childId) => {
+      interrupted.push(childId)
+      // Models subagents.interrupt: the Executor's result promise rejects after the cancel.
+      rejectLive?.(new Error('executor interrupted by ancestor'))
+    },
   }
   const ctx = {
     tools: { register: (tool) => tools.set(tool.name, tool) },
@@ -61,6 +89,14 @@ async function runScenario(name) {
   const readStore = async () => JSON.parse(await readFile(join(dir, 'tickets.json'), 'utf8'))
   const readMemories = async () => JSON.parse(await readFile(join(dir, 'memory.json'), 'utf8'))
   const sleep = (ms) => new Promise(r => setTimeout(r, ms))
+  const waitFor = async (predicate, timeoutMs) => {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      if (await predicate()) return true
+      await sleep(25)
+    }
+    return false
+  }
 
   if (name === 'rejected-trigger-is-idempotent') {
     // A listed sender addressing the agent is explicit; an unlisted one falls to the admission
@@ -108,6 +144,40 @@ async function runScenario(name) {
     const ticket = store.tickets.find(t => t.id === ticketId)
     check('ticket stays ended', ticket.status === 'ended', ticket.status)
     check('assignment stays cancelled', ticket.assignment?.status === 'cancelled', ticket.assignment?.status)
+  }
+
+  if (name === 'cancel-during-running-executor') {
+    // The Executor is mid-run. A cancel interrupts it, and its result promise rejects *after*
+    // the cancel has already written ended/cancelled. The failure path must not treat that
+    // rejection as a retryable error and overwrite the withdraw.
+    apply(ctx, { autoDispatch: true, maxConcurrent: 1, startupDelayMs: 0, executorTimeoutMs: 60_000, maxRetries: 1 })
+    const request = tools.get('superagent_request')
+    const cancel = tools.get('superagent_cancel')
+    const accepted = await request.execute({ text: 'cancel while running', sender: 'u', title: 'running' })
+    const ticketId = accepted.ticket?.ticket_id
+    // execute() returns as soon as the Ticket is queued; the pump starts the Executor on the
+    // next turn, so wait for it instead of reading activations immediately.
+    const started = await waitFor(async () => activations >= 1, 3_000)
+    check('executor started', started, `activations: ${activations}`)
+
+    const running = await waitFor(async () => {
+      const store = await readStore()
+      return store.tickets.find(t => t.id === ticketId)?.assignment?.status === 'running'
+    }, 3_000)
+    check('assignment reached running', running, running ? 'running' : 'never became running')
+
+    const cancelled = await cancel.execute({ ticket_id: ticketId, reason: 'stop while running' })
+    check('cancel accepted', cancelled.status === 'ended', cancelled.status)
+    check('executor was interrupted', interrupted.length === 1, `interrupt calls: ${interrupted.length}`)
+
+    // Past the retry backoff: a buggy failure path would schedule a second activation here.
+    await sleep(1_500)
+    check('executor never restarted', activations === 1, `activations: ${activations}`)
+    const store = await readStore()
+    const ticket = store.tickets.find(t => t.id === ticketId)
+    check('ticket stays ended', ticket.status === 'ended', ticket.status)
+    check('assignment stays cancelled', ticket.assignment?.status === 'cancelled', ticket.assignment?.status)
+    check('cancel reason was kept', ticket.report?.reason === 'stop while running', String(ticket.report?.reason))
   }
 
   await rm(dir, { recursive: true, force: true })

@@ -251,6 +251,28 @@ export function apply(ctx, config = {}) {
         await writeStore(store)
       })
     }
+    /**
+     * Writes fields only if the stored Ticket is still live, all inside one lock.
+     *
+     * The failure path must not trust the in-memory `ticket`: a person can cancel while the
+     * Executor runs, and the cancel handler writes `status: 'ended'` / `assignment.status:
+     * 'cancelled'`. Re-reading and writing under the same lock is what keeps that decision
+     * from being overwritten by a retry that was decided a moment earlier.
+     *
+     * Returns false when the Ticket has already been ended or its Assignment cancelled.
+     */
+    async function patchIfLive(fields) {
+      return storeLock(async () => {
+        const store = await readStore()
+        const row = store.tickets.find(t => t.id === ticket.id)
+        if (!row) return false
+        if (row.status !== 'open') return false
+        if (row.assignment?.status === 'cancelled') return false
+        Object.assign(row, fields)
+        await writeStore(store)
+        return true
+      })
+    }
     try {
       const subagents = ctx.get('subagents')
       const agents = ctx.get('agents')
@@ -322,6 +344,17 @@ export function apply(ctx, config = {}) {
       })
     } catch (error) {
       const reason = String(error?.message ?? error)
+
+      // The Executor can fail because a person interrupted it. Before deciding to retry, read
+      // the stored Ticket under the lock: if it is already ended or cancelled, that decision
+      // wins and this failure is just the interrupt landing. Nothing may be written here.
+      const live = await storeLock(async () => {
+        const snapshot = await readStore()
+        const current = snapshot.tickets.find(t => t.id === ticket.id)
+        return Boolean(current) && current.status === 'open' && current.assignment?.status !== 'cancelled'
+      })
+      if (!live) return
+
       const attempts = (ticket._attempts ?? 0) + 1
       // patch() only writes the stored row; keep this in-memory copy in step or the next
       // attempt would restart the counter and retry forever.
@@ -330,10 +363,13 @@ export function apply(ctx, config = {}) {
         // Keep the same Ticket and Mandate; only the Assignment is retried.
         const backoff = Math.min(30_000, 1_000 * 2 ** (attempts - 1))
         const retryAt = new Date(Date.now() + backoff).toISOString()
-        await patch({
+        // Check and write in one lock: a cancel can land between the read above and this
+        // patch, and it must not be overwritten by a retry that was already decided.
+        const scheduled = await patchIfLive({
           _attempts: attempts,
           assignment: { ...(ticket.assignment ?? {}), executor: null, status: 'pending', error: reason, retry_at: retryAt },
-        }).catch(() => {})
+        }).catch(() => false)
+        if (!scheduled) return
         const retry = setTimeout(() => {
           // Re-read before requeueing. A person may have cancelled the Ticket during the
           // backoff, or resumed it by hand: either decision outranks this pending retry.
@@ -352,11 +388,11 @@ export function apply(ctx, config = {}) {
       }
       // Terminal failure: the Ticket and its Assignment end together, so a list that filters
       // on either one sees the same thing.
-      await patch({
+      const failed = await patchIfLive({
         status: 'ended',
         assignment: { ...(ticket.assignment ?? {}), status: 'failed', error: reason, ended_at: new Date().toISOString() },
-      }).catch(() => {})
-      ticket.status = 'ended'
+      }).catch(() => false)
+      if (failed) ticket.status = 'ended'
     } finally {
       live.delete(ticket.id)
     }

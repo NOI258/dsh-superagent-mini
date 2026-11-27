@@ -95,6 +95,21 @@ node test/consistency.mjs
 
 三个都是独立进程、临时 store，不碰真实数据。`resilience` 跑超时和重试，`consistency` 跑 Trigger 幂等、Memory 并发写、取消打断重试。
 
+## 运行环境
+
+宿主是一台 Android 15 手机（骁龙 4 Gen 2，12 GB 内存 / 256 GB 存储），没有电脑。DeepSeek Harness 跑在 Termux + proot 的 Ubuntu 24.04 LTS（aarch64）容器里，本插件以 `web` profile 加载。
+
+容器内能查到的（实测）：
+
+- Ubuntu 24.04.5 LTS，aarch64，内核 5.10-gki
+- 8 个核；`/proc/self/status` 的 `TracerPid` 非 0，proot 在跟踪
+- 可见内存 11.1 GiB，根分区 224 GiB（已用 90%）
+- Node v24.22.1、npm 11.19.1
+
+Android 版本、SoC 型号、整机容量在容器里查不到（没有 `getprop`），这部分按机主说明。
+
+三个测试文件只依赖 Node 标准库（`node:zlib`、`node:child_process`），每个场景跑在独立子进程和临时 store 里，不碰真实数据。同样，只有这套环境是实测过的。
+
 ## License
 
 MIT。部分代码来自 [deepseek-ai/dsh-superagent-prototype](https://github.com/deepseek-ai/dsh-superagent-prototype)，版权归 DeepSeek Harness Team，同样 MIT。完整声明见 LICENSE。
