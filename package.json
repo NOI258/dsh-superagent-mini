@@ -1,0 +1,30 @@
+{
+  "name": "dsh-superagent-mini",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "description": "Minimal super-agent loop for DSH: request → ticket → executor session, with long-term memory",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "agent",
+    "ticket",
+    "memory"
+  ],
+  "license": "MIT"
+}
