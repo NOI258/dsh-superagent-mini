@@ -155,7 +155,7 @@ node test/stress.mjs S2 S7        # 只跑指定场景
 
 ## 运行环境
 
-宿主是一台 Android 15 手机（骁龙 4 Gen 2，12 GB 内存 / 256 GB 存储），没有电脑。DeepSeek Harness 跑在 Termux + proot 的 Ubuntu 24.04 LTS（aarch64）容器里，本插件以 `web` profile 加载。
+宿主是一台 **vivo Y300i**（型号 V2444A，平台 PD2444），Android 15、骁龙 4 Gen 2（4nm）、6500mAh 电池、12 GB 内存 / 256 GB 存储，没有电脑。DeepSeek Harness 跑在 Termux + proot 的 Ubuntu 24.04 LTS（aarch64）容器里，本插件以 `web` profile 加载。
 
 容器内能查到的（实测）：
 
@@ -164,7 +164,7 @@ node test/stress.mjs S2 S7        # 只跑指定场景
 - 可见内存 11.1 GiB，根分区 224 GiB（已用 90%）
 - Node v24.22.1、npm 11.19.1
 
-Android 版本、SoC 型号、整机容量在容器里查不到（没有 `getprop`），这部分按机主说明。
+容器里没有 `getprop`，所以上面这些是机主说明 + 手机端实测补的（2026-11-27）：`ro.product.model=V2444A`、`ro.product.device=PD2444`、`ro.build.version.release=15`、`ro.board.platform=parrot`。
 
 五个测试文件只依赖 Node 标准库（`node:zlib`、`node:child_process`、`node:fs`），每个场景跑在独立子进程和临时 store 里，不碰真实数据。只有这套环境是实测过的。
 
