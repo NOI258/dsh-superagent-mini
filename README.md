@@ -90,7 +90,10 @@ dsh plugin --profile web add github:NOI258/dsh-superagent-mini
 ```bash
 node test/smoke.mjs
 node test/resilience.mjs
+node test/consistency.mjs
 ```
+
+三个都是独立进程、临时 store，不碰真实数据。`resilience` 跑超时和重试，`consistency` 跑 Trigger 幂等、Memory 并发写、取消打断重试。
 
 ## License
 

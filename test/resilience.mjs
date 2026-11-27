@@ -43,6 +43,11 @@ async function runScenario(name) {
   let activations = 0
   const hang = () => new Promise(() => {}) // never settles: models a stuck Executor
 
+  const failLater = (message) => new Promise((_, reject) => {
+    // Reject on a later tick: dispatchTicket awaits a store patch before it can attach a
+    // handler to result, and an already-rejected promise would surface as unhandled.
+    setTimeout(() => reject(new Error(message)), 0)
+  })
   const subagents = {
     list: () => ['mock-provider'],
     startActivation: async (opts) => {
@@ -53,10 +58,10 @@ async function runScenario(name) {
         result = hang()
       } else if (name === 'error-retry-then-success') {
         result = activations === 1
-          ? Promise.reject(new Error('boom: provider crashed'))
+          ? failLater('boom: provider crashed')
           : Promise.resolve({ output: [{ type: 'text', text: 'recovered' }], stopReason: 'done' })
       } else {
-        result = Promise.reject(new Error(`boom #${activations}`))
+        result = failLater(`boom #${activations}`)
       }
       return { childId, result }
     },
@@ -79,7 +84,8 @@ async function runScenario(name) {
 
   const request = tools.get('superagent_request')
   const accepted = await request.execute({ text: `scenario ${name}`, sender: 'u', title: name })
-  const ticketId = accepted.ticket_id
+  // accept() returns { decision, trigger, ticket }; the id is nested as ticket.ticket_id.
+  const ticketId = accepted.ticket?.ticket_id
   check('request accepted', accepted.decision === 'accept', accepted.decision)
 
   const readTicket = async () => {

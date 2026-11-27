@@ -1,0 +1,119 @@
+// Consistency tests: trigger idempotence, memory write ordering, cancel-during-retry.
+//
+// Each scenario needs its own store, and the store path is resolved at module load, so every
+// case runs in a child process. The parent only spawns and reports.
+import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+
+const self = fileURLToPath(import.meta.url)
+const scenario = process.argv[2]
+
+if (scenario) {
+  await runScenario(scenario)
+} else {
+  let failed = 0
+  for (const name of ['rejected-trigger-is-idempotent', 'memory-writes-do-not-collide', 'cancel-stops-pending-retry']) {
+    const code = await new Promise((resolve) => {
+      const child = spawn(process.execPath, [self, name], { stdio: 'inherit' })
+      child.on('exit', resolve)
+    })
+    if (code !== 0) failed++
+  }
+  console.log(failed === 0 ? '\nALL PASS' : `\nFAILED scenarios: ${failed}`)
+  process.exit(failed === 0 ? 0 : 1)
+}
+
+async function runScenario(name) {
+  const { mkdtemp, readFile, rm } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+
+  const dir = await mkdtemp(join(tmpdir(), `sa-con-${name}-`))
+  process.env.DSH_SUPERAGENT_MINI_DIR = dir
+  const { apply } = await import('../index.js')
+
+  const failures = []
+  const check = (label, ok, detail) => {
+    console.log(`${ok ? 'PASS' : 'FAIL'}  [${name}] ${label}${detail ? ` — ${detail}` : ''}`)
+    if (!ok) failures.push(label)
+  }
+
+  const tools = new Map()
+  let activations = 0
+  const failLater = (message) => new Promise((_, reject) => {
+    setTimeout(() => reject(new Error(message)), 0)
+  })
+
+  const subagents = {
+    list: () => ['mock-provider'],
+    startActivation: async () => {
+      activations++
+      return { childId: `child-${activations}`, result: failLater(`boom #${activations}`) }
+    },
+    interrupt: () => {},
+  }
+  const ctx = {
+    tools: { register: (tool) => tools.set(tool.name, tool) },
+    get: (key) => (key === 'subagents' ? subagents : key === 'agents' ? { currentInitiator: () => ({ id: 'parent' }) } : undefined),
+    logger: { info: () => {}, warn: () => {} },
+  }
+
+  const readStore = async () => JSON.parse(await readFile(join(dir, 'tickets.json'), 'utf8'))
+  const readMemories = async () => JSON.parse(await readFile(join(dir, 'memory.json'), 'utf8'))
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms))
+
+  if (name === 'rejected-trigger-is-idempotent') {
+    // A listed sender addressing the agent is explicit; an unlisted one falls to the admission
+    // matrix and is ignored. The rejection must still be recorded, or the next identical
+    // delivery looks new and gets a second decision.
+    apply(ctx, { autoDispatch: true, maxConcurrent: 1, startupDelayMs: 0, allowedSenders: ['u'] })
+    const request = tools.get('superagent_request')
+    const first = await request.execute({ text: 'drop this', sender: 'stranger' })
+    const second = await request.execute({ text: 'drop this', sender: 'stranger' })
+    check('first delivery is ignored', first.decision === 'ignore', first.decision)
+    check('second delivery is a duplicate', second.decision === 'duplicate', second.decision)
+    check('duplicate reports the earlier rejection', second.previous === 'rejected', second.previous)
+    const store = await readStore()
+    check('no Ticket was created', store.tickets.length === 0, `tickets: ${store.tickets.length}`)
+    check('one trigger recorded', Object.keys(store.triggers).length === 1, `triggers: ${Object.keys(store.triggers).length}`)
+  }
+
+  if (name === 'memory-writes-do-not-collide') {
+    // Ten concurrent writers on one file. Without a lock they all read the same snapshot and
+    // the last rename wins, silently dropping the other nine lessons.
+    apply(ctx, { autoDispatch: false })
+    const remember = tools.get('superagent_remember')
+    await Promise.all(Array.from({ length: 10 }, (_, i) =>
+      remember.execute({ text: `lesson number ${i}`, tags: ['concurrency'], scope: 't' })))
+    const state = await readMemories()
+    check('all ten memories persisted', state.memories.length === 10, `stored: ${state.memories.length}`)
+    const distinct = new Set(state.memories.map(m => m.text)).size
+    check('no memory was lost or duplicated', distinct === 10, `distinct: ${distinct}`)
+  }
+
+  if (name === 'cancel-stops-pending-retry') {
+    // One retry is scheduled after the first failure. Cancelling inside the backoff window
+    // must win: the timer is not allowed to requeue a withdrawn Ticket.
+    apply(ctx, { autoDispatch: true, maxConcurrent: 1, startupDelayMs: 0, executorTimeoutMs: 1_000, maxRetries: 1 })
+    const request = tools.get('superagent_request')
+    const accepted = await request.execute({ text: 'cancel me', sender: 'u', title: 'cancel me' })
+    const ticketId = accepted.ticket?.ticket_id
+    await sleep(200) // first attempt failed; retry is now pending
+    const cancel = tools.get('superagent_cancel')
+    const cancelled = await cancel.execute({ ticket_id: ticketId, reason: 'changed my mind' })
+    check('cancel accepted', cancelled.status === 'ended', cancelled.status)
+    await sleep(1_500) // past the 1s backoff
+    check('retry never ran', activations === 1, `activations: ${activations}`)
+    const store = await readStore()
+    const ticket = store.tickets.find(t => t.id === ticketId)
+    check('ticket stays ended', ticket.status === 'ended', ticket.status)
+    check('assignment stays cancelled', ticket.assignment?.status === 'cancelled', ticket.assignment?.status)
+  }
+
+  await rm(dir, { recursive: true, force: true })
+  if (failures.length > 0) {
+    console.log(`\n${name}: FAILED → ${failures.join(', ')}`)
+    process.exit(1)
+  }
+  console.log(`${name}: ok\n`)
+}

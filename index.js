@@ -107,6 +107,10 @@ export function apply(ctx, config = {}) {
   const autoDispatch = config.autoDispatch ?? true
   const admission = { ...ADMISSION_DEFAULTS, ...(config.admission ?? {}) }
   const storeLock = createMutex()
+  // memory.json is a second file with its own read-modify-write cycle. It gets a separate
+  // lock: memory tools should not queue behind Ticket bookkeeping, but two concurrent
+  // writers must still not read the same snapshot and drop each other's rows.
+  const memoryLock = createMutex()
   const executorTimeoutMs = Math.max(1_000, Number(config.executorTimeoutMs ?? DEFAULT_EXECUTOR_TIMEOUT_MS))
   const maxRetries = Math.max(0, Number(config.maxRetries ?? DEFAULT_MAX_RETRIES))
   // Recovery runs during `apply`, which is before every other plugin has finished registering
@@ -269,6 +273,11 @@ export function apply(ctx, config = {}) {
         delivery: 'parent',
       })
 
+      // The Executor may reject before Promise.race below attaches a handler: the store patch
+      // in between is an await. Mark the rejection handled now so a fast failure cannot escape
+      // as an unhandled rejection and kill the process.
+      activation.result?.catch?.(() => {})
+
       live.set(ticket.id, { parent, childId: String(activation.childId) })
       await patch({ assignment: { executor: String(activation.childId), status: 'running', started_at: new Date().toISOString() } })
 
@@ -314,23 +323,40 @@ export function apply(ctx, config = {}) {
     } catch (error) {
       const reason = String(error?.message ?? error)
       const attempts = (ticket._attempts ?? 0) + 1
+      // patch() only writes the stored row; keep this in-memory copy in step or the next
+      // attempt would restart the counter and retry forever.
+      ticket._attempts = attempts
       if (attempts <= maxRetries) {
         // Keep the same Ticket and Mandate; only the Assignment is retried.
         const backoff = Math.min(30_000, 1_000 * 2 ** (attempts - 1))
+        const retryAt = new Date(Date.now() + backoff).toISOString()
         await patch({
           _attempts: attempts,
-          assignment: { ...(ticket.assignment ?? {}), executor: null, status: 'pending', error: reason, retry_at: new Date(Date.now() + backoff).toISOString() },
+          assignment: { ...(ticket.assignment ?? {}), executor: null, status: 'pending', error: reason, retry_at: retryAt },
         }).catch(() => {})
         const retry = setTimeout(() => {
-          ticket.assignment = { ...(ticket.assignment ?? {}), status: 'pending' }
-          enqueue(ticket)
+          // Re-read before requeueing. A person may have cancelled the Ticket during the
+          // backoff, or resumed it by hand: either decision outranks this pending retry.
+          void storeLock(async () => {
+            const snapshot = await readStore()
+            const current = snapshot.tickets.find(t => t.id === ticket.id)
+            if (!current || current.status !== 'open') return
+            if (current.assignment?.status !== 'pending' || current.assignment?.retry_at !== retryAt) return
+            current.assignment = { ...current.assignment, executor: null, retry_at: null }
+            await writeStore(snapshot)
+            enqueue(current)
+          }).catch(() => {})
         }, backoff)
         retry.unref?.()
         return
       }
+      // Terminal failure: the Ticket and its Assignment end together, so a list that filters
+      // on either one sees the same thing.
       await patch({
+        status: 'ended',
         assignment: { ...(ticket.assignment ?? {}), status: 'failed', error: reason, ended_at: new Date().toISOString() },
       }).catch(() => {})
+      ticket.status = 'ended'
     } finally {
       live.delete(ticket.id)
     }
@@ -356,10 +382,19 @@ export function apply(ctx, config = {}) {
 
     const key = triggerKey(source, thread, sender, text)
     const store = await readStore()
+    store.triggers ??= {}
 
     // Idempotence: one Trigger is accepted once, however many times it is delivered.
-    if (store.triggers[key]) {
-      return { decision: 'duplicate', trigger: key, ticket: summarize(store.tickets.find(t => t.id === store.triggers[key])) }
+    // A rejection is recorded as a key with no Ticket id. Presence, not truthiness, is the
+    // test — a `null` value is still a decision that this Trigger was already handled.
+    if (Object.hasOwn(store.triggers, key)) {
+      const ticketId = store.triggers[key]
+      return {
+        decision: 'duplicate',
+        trigger: key,
+        ticket: ticketId ? summarize(store.tickets.find(t => t.id === ticketId)) : null,
+        previous: ticketId ? 'accepted' : 'rejected',
+      }
     }
     store.triggers[key] = null
 
@@ -680,7 +715,7 @@ export function apply(ctx, config = {}) {
       schema: { type: 'object', additionalProperties: true },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
-    execute: async (args) => {
+    execute: async (args) => memoryLock(async () => {
       const state = await readMemories()
       const id = `m-${createHash('sha256').update(args.text).digest('hex').slice(0, 10)}`
       // Same text means the same lesson: update it instead of keeping two copies.
@@ -697,7 +732,7 @@ export function apply(ctx, config = {}) {
       else state.memories.push(record)
       await writeMemories(state)
       return { id, updated: existing >= 0, total: state.memories.length }
-    },
+    }),
   })
 
   ctx.tools.register({
@@ -745,14 +780,14 @@ export function apply(ctx, config = {}) {
       schema: { type: 'object', additionalProperties: true },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
-    execute: async (args) => {
+    execute: async (args) => memoryLock(async () => {
       const state = await readMemories()
       const before = state.memories.length
       state.memories = state.memories.filter(m => m.id !== args.id)
       if (state.memories.length === before) return { error: 'not_found', id: args.id }
       await writeMemories(state)
       return { id: args.id, deleted: true, remaining: state.memories.length }
-    },
+    }),
   })
 
   ctx.tools.register({
