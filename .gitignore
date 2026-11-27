@@ -1,0 +1,8 @@
+node_modules/
+*.log
+.DS_Store
+
+# store 默认在 $DSH_HOME/superagent-mini 下；本地跑测试时如果指到仓库里，
+# 这两个文件不该进版本库。
+tickets.json
+memory.json
