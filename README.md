@@ -91,9 +91,12 @@ dsh plugin --profile web add github:NOI258/dsh-superagent-mini
 node test/smoke.mjs
 node test/resilience.mjs
 node test/consistency.mjs
+node test/regressions.mjs
 ```
 
-三个都是独立进程、临时 store，不碰真实数据。`resilience` 跑超时和重试，`consistency` 跑 Trigger 幂等、Memory 并发写、取消打断重试。
+四个都是独立进程、临时 store，不碰真实数据。`resilience` 跑超时和重试，`consistency` 跑 Trigger 幂等、Memory 并发写、取消打断重试，`regressions` 是每次修完 bug 往里加的防回归用例（取消落在启动窗口、同票双 Executor、排队时 reply 丢失、取消毁掉完成报告等）。
+
+新写用例时注意：断言要能描述「修好之后应该成立」的那一侧，然后拿旧代码跑一遍确认它会 FAIL。只验证「全绿」等于没验证——2026-11-27 那轮 7 处修复，旧代码下正好 7 个断言失败，恢复后全绿，这才说明测试真的在测东西。
 
 ## 运行环境
 
