@@ -79,19 +79,16 @@ $DSH_PROFILE_DIR/superagent-mini  否则跟着 profile
 
 ## 装
 
-从 GitHub 装：
+用 DSH 自己的插件机制装，不经过 npm：
 
 ```bash
 dsh plugin --profile web add github:NOI258/dsh-superagent-mini
 ```
 
-或从 npm 装（已发布的话）：
-
-```bash
-dsh plugin --profile web add dsh-superagent-mini
-```
-
 装完重启，十一个 `superagent_*` 工具出现在工具列表里。
+
+`package.json` 里的 `dsh.bundle.patch` 指向 `cordis.patch.yml`，DSH 靠这个把插件挂进
+composition。要改配置或换挂载方式，动那个文件，不用关心 npm。
 
 ## 不足
 
