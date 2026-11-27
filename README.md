@@ -170,4 +170,4 @@ node test/stress.mjs S2 S7        # 只跑指定场景
 
 ## License
 
-MIT。部分代码来自 [deepseek-ai/dsh-superagent-prototype](https://github.com/deepseek-ai/dsh-superagent-prototype)，版权归 DeepSeek Harness Team，同样 MIT。完整声明见 LICENSE。
+MIT，© 2026 NOI258。部分代码来自 [deepseek-ai/dsh-superagent-prototype](https://github.com/deepseek-ai/dsh-superagent-prototype)，版权归 DeepSeek Harness Team，同样 MIT。完整声明见 LICENSE。
